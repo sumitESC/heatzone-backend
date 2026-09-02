@@ -1,0 +1,337 @@
+import os
+import sys
+import json
+import numpy as np
+import pandas as pd
+import torch
+from torch.amp import autocast
+
+import config
+from models.sat_model import config as sat_config
+from models.sat_model.model import SpatiotemporalCrossAttentionModel
+from models.lstm_transformer.confidence import compute_forecast_confidence
+
+# Global variables to hold models
+_sat_model = None
+_model_config = None
+_feature_dims = None
+_device = None
+
+def load_models():
+    """Load the SAT model into memory globally."""
+    global _sat_model, _model_config, _feature_dims, _device
+    
+    if _sat_model is not None:
+        return  # Already loaded
+        
+    _device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Loading AI Models on {_device}...")
+
+    checkpoint = torch.load(sat_config.MODEL_PATH, map_location=_device, weights_only=False)
+
+    _feature_dims = checkpoint["feature_dims"]
+    _model_config = checkpoint["config"]
+
+    _sat_model = SpatiotemporalCrossAttentionModel(
+        n_weather_features=_feature_dims["n_weather_features"],
+        n_context_features=_feature_dims["n_context_features"],
+        n_targets=_feature_dims["n_targets"],
+        embed_dim=_model_config["embed_dim"],
+        transformer_heads=_model_config["transformer_heads"],
+        encoder_layers=_model_config["encoder_layers"],
+        cross_attn_layers=_model_config["cross_attn_layers"],
+        transformer_ff_dim=_model_config["transformer_ff_dim"],
+        dropout=_model_config["dropout"],
+        seq_length=_model_config["seq_length"],
+        forecast_horizon=_model_config["forecast_horizon"],
+    ).to(_device)
+
+    _sat_model.load_state_dict(checkpoint["model_state_dict"])
+    _sat_model.eval()
+    print(f"SpatiotemporalCrossAttentionModel loaded ({_sat_model.count_parameters():,} params).")
+
+
+def generate_forecast(city: str, date=None, mc_samples=10):
+    """
+    Generate a 16-day forecast using the loaded model.
+    """
+    if _sat_model is None:
+        load_models()
+
+    target_names = _model_config["target_cols"]
+    seq_length = _model_config["seq_length"]
+    forecast_horizon = _model_config["forecast_horizon"]
+
+    # Load local data (falling back to the processed CSV for now)
+    weather_df = pd.read_csv(config.UP_WEATHER_CSV)
+    weather_df["Date"] = pd.to_datetime(weather_df["Date"])
+
+    city_df = weather_df[weather_df["City"] == city].sort_values("Date")
+    if city_df.empty:
+        raise ValueError(f"City '{city}' not found in dataset.")
+
+    # Compute days since satellite update
+    if "Scene_ID" in city_df.columns:
+        is_new_image = city_df["Scene_ID"] != city_df["Scene_ID"].shift(1)
+        is_new_image = is_new_image & city_df["Scene_ID"].notna()
+        city_df["last_update_date"] = city_df["Date"].where(is_new_image).ffill()
+        city_df["days_since_satellite_update"] = (city_df["Date"] - city_df["last_update_date"]).dt.days.fillna(0)
+    else:
+        city_df["days_since_satellite_update"] = 0.0
+
+    if date is not None:
+        date = pd.Timestamp(date)
+        city_df = city_df[city_df["Date"] <= date]
+
+    # Get the last seq_length days
+    recent = city_df.tail(seq_length).copy()
+    base_date = recent["Date"].iloc[-1]
+
+    if len(recent) < seq_length:
+        while len(recent) < seq_length:
+            recent = pd.concat([recent.iloc[:1], recent], ignore_index=True)
+
+    # Build weather features
+    weather_cols = [c for c in sat_config.WEATHER_FEATURE_COLS if c in recent.columns]
+
+    if sat_config.WIND_DIR_COL in recent.columns:
+        wind_rad = np.deg2rad(recent[sat_config.WIND_DIR_COL].fillna(0))
+        recent["Wind_Dir_Sin"] = np.sin(wind_rad)
+        recent["Wind_Dir_Cos"] = np.cos(wind_rad)
+        weather_cols += ["Wind_Dir_Sin", "Wind_Dir_Cos"]
+
+    weather_array = recent[weather_cols].fillna(0).values.astype(np.float32)
+    
+    if "Precipitation_mm" in weather_cols:
+        precip_feat_idx = weather_cols.index("Precipitation_mm")
+        weather_array[:, precip_feat_idx] = np.log1p(np.maximum(weather_array[:, precip_feat_idx], 0))
+
+    expected_feats = _feature_dims["n_weather_features"]
+    if weather_array.shape[1] < expected_feats:
+        pad = np.zeros((weather_array.shape[0], expected_feats - weather_array.shape[1]), dtype=np.float32)
+        weather_array = np.concatenate([weather_array, pad], axis=1)
+
+    expected_ctx = _feature_dims["n_context_features"]
+    context_array = np.zeros((seq_length, max(expected_ctx, 1)), dtype=np.float32)
+    
+    # We will just pass empty context arrays for now to ensure it works quickly
+    # (The live satellite pipeline will replace this)
+
+    # Apply standard scaling and clip to prevent FP16 overflows
+    weather_mean = _feature_dims["weather_mean"]
+    weather_std = _feature_dims["weather_std"]
+    weather_array = (weather_array - weather_mean) / weather_std
+    weather_array = np.clip(weather_array, -10.0, 10.0)
+
+    # Context is zeros, but we should scale it if context_mean is present
+    if "context_mean" in _feature_dims:
+        ctx_mean = _feature_dims["context_mean"]
+        ctx_std = _feature_dims["context_std"]
+        context_array = (context_array - ctx_mean) / ctx_std
+        context_array = np.clip(context_array, -10.0, 10.0)
+
+    weather_tensor = torch.tensor(weather_array, dtype=torch.float32).unsqueeze(0).to(_device)
+    context_tensor = torch.tensor(context_array, dtype=torch.float32).unsqueeze(0).to(_device)
+
+    # Run Prediction
+    mc_predictions = []
+    _sat_model.train() # For MC dropout
+    with torch.no_grad():
+        for _ in range(mc_samples):
+            if _device.type == "cuda":
+                with autocast("cuda"):
+                    preds, _ = _sat_model(weather_tensor, context_tensor)
+            else:
+                preds, _ = _sat_model(weather_tensor, context_tensor)
+            mc_predictions.append(preds.cpu().numpy()[0])
+
+    mc_predictions = np.array(mc_predictions)
+    mean_preds = mc_predictions.mean(axis=0)
+
+    # Inverse log-transform precipitation
+    if "Precipitation_mm" in target_names:
+        pidx = target_names.index("Precipitation_mm")
+        mean_preds[:, pidx] = np.expm1(np.maximum(mean_preds[:, pidx], 0))
+
+    forecast_dates = pd.date_range(base_date + pd.Timedelta(days=1), periods=forecast_horizon, freq="D")
+    
+    predictions = []
+    for i in range(forecast_horizon):
+        pred_dict = {"date": forecast_dates[i].strftime("%Y-%m-%d")}
+        for t_idx, target_name in enumerate(target_names):
+            pred_dict[target_name] = float(mean_preds[i, t_idx])
+        predictions.append(pred_dict)
+
+    return {
+        "predictions": predictions,
+        "base_date": base_date.strftime("%Y-%m-%d")
+    }
+
+def generate_satellite_forecast(city: str, date=None, mc_samples=10):
+    """
+    Generate a 16-day forecast using the loaded model and actual satellite data for both
+    the target city and the context sentinel cities.
+    """
+    if _sat_model is None:
+        load_models()
+
+    target_names = _model_config["target_cols"]
+    seq_length = _model_config["seq_length"]
+    forecast_horizon = _model_config["forecast_horizon"]
+
+    # Load local data WITH satellite features
+    weather_df = pd.read_csv(config.ML_READY_HISTORICAL_CSV)
+    weather_df["Date"] = pd.to_datetime(weather_df["Date"])
+
+    city_df = weather_df[weather_df["City"] == city].sort_values("Date")
+    if city_df.empty:
+        raise ValueError(f"City '{city}' not found in satellite dataset.")
+
+    # Compute days since satellite update
+    if "Scene_ID" in city_df.columns:
+        is_new_image = city_df["Scene_ID"] != city_df["Scene_ID"].shift(1)
+        is_new_image = is_new_image & city_df["Scene_ID"].notna()
+        city_df["last_update_date"] = city_df["Date"].where(is_new_image).ffill()
+        city_df["days_since_satellite_update"] = (city_df["Date"] - city_df["last_update_date"]).dt.days.fillna(0)
+    else:
+        city_df["days_since_satellite_update"] = 0.0
+
+    if date is not None:
+        date = pd.Timestamp(date)
+        city_df = city_df[city_df["Date"] <= date]
+
+    recent = city_df.tail(seq_length).copy()
+    base_date = recent["Date"].iloc[-1]
+
+    if len(recent) < seq_length:
+        while len(recent) < seq_length:
+            recent = pd.concat([recent.iloc[:1], recent], ignore_index=True)
+
+    # Build weather features
+    weather_cols = [c for c in sat_config.WEATHER_FEATURE_COLS if c in recent.columns]
+    
+    if sat_config.WIND_DIR_COL in recent.columns:
+        wind_rad = np.deg2rad(recent[sat_config.WIND_DIR_COL].fillna(0))
+        recent["Wind_Dir_Sin"] = np.sin(wind_rad)
+        recent["Wind_Dir_Cos"] = np.cos(wind_rad)
+        weather_cols += ["Wind_Dir_Sin", "Wind_Dir_Cos"]
+        
+    # Only use as many features as the model was trained on
+    weather_array = recent[weather_cols].fillna(0).values.astype(np.float32)
+    
+    if "Precipitation_mm" in weather_cols:
+        precip_feat_idx = weather_cols.index("Precipitation_mm")
+        weather_array[:, precip_feat_idx] = np.log1p(np.maximum(weather_array[:, precip_feat_idx], 0))
+
+    expected_feats = _feature_dims["n_weather_features"]
+    if weather_array.shape[1] > expected_feats:
+        weather_array = weather_array[:, :expected_feats]
+    elif weather_array.shape[1] < expected_feats:
+        pad = np.zeros((weather_array.shape[0], expected_feats - weather_array.shape[1]), dtype=np.float32)
+        weather_array = np.concatenate([weather_array, pad], axis=1)
+
+    # Context Features loaded from ML Ready Context CSV
+    context_df = pd.read_csv(config.ML_READY_CONTEXT_CSV)
+    context_df["Date"] = pd.to_datetime(context_df["Date"])
+    
+    expected_ctx = _feature_dims["n_context_features"]
+    context_array = np.zeros((seq_length, max(expected_ctx, 1)), dtype=np.float32)
+    
+    if date is None:
+        target_dt = base_date
+    else:
+        target_dt = pd.Timestamp(date)
+        
+    start_dt = target_dt - pd.Timedelta(days=seq_length - 1)
+    mask = (context_df["Date"] >= start_dt) & (context_df["Date"] <= target_dt)
+    ctx_recent = context_df[mask]
+    
+    if not ctx_recent.empty:
+        agg_ctx = ctx_recent.groupby("Date").mean(numeric_only=True).sort_index()
+        # Find all available context features up to the expected size
+        avail_ctx_cols = [c for c in agg_ctx.columns if c not in ["Date", "Year", "Month", "Day"]]
+        
+        ctx_features_np = agg_ctx[avail_ctx_cols].fillna(0).values.astype(np.float32)
+        ctx_features_np = ctx_features_np[-seq_length:]
+        
+        if len(ctx_features_np) < seq_length and len(ctx_features_np) > 0:
+             pad = np.repeat(ctx_features_np[:1], seq_length - len(ctx_features_np), axis=0)
+             ctx_features_np = np.concatenate([pad, ctx_features_np], axis=0)
+             
+        if len(ctx_features_np) == seq_length:
+            feats_to_copy = min(ctx_features_np.shape[1], expected_ctx)
+            context_array[:, :feats_to_copy] = ctx_features_np[:, :feats_to_copy]
+
+    # Apply standard scaling and clip to prevent FP16 overflows
+    weather_mean = _feature_dims["weather_mean"]
+    weather_std = _feature_dims["weather_std"]
+    weather_array = (weather_array - weather_mean) / weather_std
+    weather_array = np.clip(weather_array, -10.0, 10.0)
+
+    if "context_mean" in _feature_dims:
+        ctx_mean = _feature_dims["context_mean"]
+        ctx_std = _feature_dims["context_std"]
+        context_array = (context_array - ctx_mean) / ctx_std
+        context_array = np.clip(context_array, -10.0, 10.0)
+
+    weather_tensor = torch.tensor(weather_array, dtype=torch.float32).unsqueeze(0).to(_device)
+    context_tensor = torch.tensor(context_array, dtype=torch.float32).unsqueeze(0).to(_device)
+
+    mc_predictions = []
+    _sat_model.train() 
+    with torch.no_grad():
+        for _ in range(mc_samples):
+            if _device.type == "cuda":
+                with autocast("cuda"):
+                    preds, _ = _sat_model(weather_tensor, context_tensor)
+            else:
+                preds, _ = _sat_model(weather_tensor, context_tensor)
+            mc_predictions.append(preds.cpu().numpy()[0])
+
+    mc_predictions = np.array(mc_predictions)
+    mean_preds = mc_predictions.mean(axis=0)
+    std_preds = mc_predictions.std(axis=0)  # For confidence calculation
+
+    if "Precipitation_mm" in target_names:
+        pidx = target_names.index("Precipitation_mm")
+        mean_preds[:, pidx] = np.expm1(np.maximum(mean_preds[:, pidx], 0))
+
+    # Load validation metrics for confidence calibration (if available)
+    val_metrics = None
+    lstm_metrics_path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "models", "lstm_transformer", "checkpoints", "validation_metrics.json"
+    )
+    if os.path.exists(lstm_metrics_path):
+        with open(lstm_metrics_path, "r") as f:
+            val_metrics = json.load(f)
+
+    forecast_dates = pd.date_range(base_date + pd.Timedelta(days=1), periods=forecast_horizon, freq="D")
+    
+    predictions = []
+    for i in range(forecast_horizon):
+        pred_dict = {"date": forecast_dates[i].strftime("%Y-%m-%d")}
+        for t_idx, target_name in enumerate(target_names):
+            pred_dict[target_name] = float(mean_preds[i, t_idx])
+        
+        # Compute dynamic confidence from MC dropout uncertainty
+        conf = compute_forecast_confidence(
+            day_ahead=i + 1,
+            mc_std=std_preds[i],
+            target_names=target_names,
+            historical_mae_by_day=val_metrics,
+        )
+        pred_dict["confidence"] = conf
+        
+        # Rain probability estimate from the prediction magnitude
+        if "Precipitation_mm" in target_names:
+            precip_val = pred_dict["Precipitation_mm"]
+            # Simple heuristic: higher precip → higher rain probability
+            pred_dict["rain_probability"] = min(1.0, max(0.0, precip_val / 5.0))
+        
+        predictions.append(pred_dict)
+
+    return {
+        "predictions": predictions,
+        "base_date": base_date.strftime("%Y-%m-%d")
+    }
