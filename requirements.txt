@@ -1,5 +1,10 @@
+fastapi
+uvicorn
+gunicorn
 requests
 pandas
 pyarrow
 schedule
 tenacity
+pydantic
+numpy
