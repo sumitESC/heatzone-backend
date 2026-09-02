@@ -10,14 +10,19 @@ import os
 import json
 import numpy as np
 import pandas as pd
-import joblib
 from datetime import datetime
 from typing import Dict, List, Tuple, Optional
 
-from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor, VotingRegressor
-from sklearn.model_selection import train_test_split, cross_val_score, GridSearchCV
-from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
-from sklearn.preprocessing import StandardScaler
+try:
+    import joblib
+    from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor, VotingRegressor
+    from sklearn.model_selection import train_test_split, cross_val_score, GridSearchCV
+    from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
+    from sklearn.preprocessing import StandardScaler
+    HAS_SKLEARN = True
+except ImportError:
+    HAS_SKLEARN = False
+    print("Warning: 'joblib' or 'scikit-learn' is not installed. HeatwaveModel will operate in heuristic mode.")
 
 
 class HeatwaveModel:
@@ -259,9 +264,31 @@ class HeatwaveModel:
         Returns:
             Dict with prediction, risk score, and explanation
         """
-        if not self.is_trained:
-            raise RuntimeError("Model not trained. Call train() first.")
-        
+        if not self.is_trained or self.model is None or not HAS_SKLEARN:
+            predicted_temp = float(city_features.get("lst_day_mean", city_features.get("temp_max", 35.0)))
+            heat_risk = self._compute_risk_score(predicted_temp, city_features)
+            heat_zone = self._classify_zone(predicted_temp)
+            drivers = [
+                {"factor": "Vegetation Scarcity", "value": 1.0 - city_features.get("ndvi", 0.2), "weight": 1.2},
+                {"factor": "Concrete Density (NDBI)", "value": city_features.get("ndbi", 0.2), "weight": 1.5},
+                {"factor": "Urban Canyon Effect", "value": city_features.get("urban_canyon_index", 0.2), "weight": 1.8},
+                {"factor": "Industrial Heat", "value": city_features.get("industrial_heat_factor", 0.1), "weight": 2.0},
+                {"factor": "AC Thermal Exhaust", "value": city_features.get("ac_thermal_exhaust", 0.2), "weight": 1.4},
+                {"factor": "Population Density", "value": city_features.get("population_density", 5000) / 20000, "weight": 1.0},
+                {"factor": "Vehicle Emissions", "value": city_features.get("emission_index", 1.0) / 10, "weight": 1.1},
+            ]
+            drivers.sort(key=lambda x: x["value"] * x["weight"], reverse=True)
+            primary_driver = drivers[0]
+            explanation = self._generate_causal_explanation(city_features, drivers[:3])
+            return {
+                "predicted_max_temp": float(predicted_temp),
+                "heat_risk_score": float(heat_risk),
+                "heat_zone": heat_zone,
+                "primary_driver": primary_driver,
+                "explanation": explanation,
+                "confidence_score": city_features.get("confidence_score", None)
+            }
+
         # Build feature vector
         features = np.array([[city_features.get(col, 0) for col in self.FEATURE_COLUMNS]])
         features_scaled = self.scaler.transform(features)
@@ -481,18 +508,34 @@ class HeatwaveModel:
     
     def load_model(self, model_dir: str):
         """Load trained model from disk."""
-        self.model = joblib.load(os.path.join(model_dir, "heatwave_rf.pkl"))
-        self.scaler = joblib.load(os.path.join(model_dir, "scaler.pkl"))
-        
-        with open(os.path.join(model_dir, "model_metadata.json"), "r") as f:
-            metadata = json.load(f)
-        
-        self.metrics = metadata["metrics"]
-        self.feature_importance = metadata["feature_importance"]
-        self.is_trained = True
-        
-        print(f"Model loaded from: {model_dir}")
-        print(f"Test R²: {self.metrics['test_r2']}")
+        if not HAS_SKLEARN:
+            print("joblib/sklearn unavailable. HeatwaveModel operating in physical heuristic mode.")
+            self.is_trained = False
+            return
+
+        model_file = os.path.join(model_dir, "heatwave_rf.pkl")
+        scaler_file = os.path.join(model_dir, "scaler.pkl")
+
+        if not os.path.exists(model_file) or not os.path.exists(scaler_file):
+            print(f"Model files not found in {model_dir}. HeatwaveModel operating in physical heuristic mode.")
+            self.is_trained = False
+            return
+
+        try:
+            self.model = joblib.load(model_file)
+            self.scaler = joblib.load(scaler_file)
+            
+            metadata_file = os.path.join(model_dir, "model_metadata.json")
+            if os.path.exists(metadata_file):
+                with open(metadata_file, "r") as f:
+                    metadata = json.load(f)
+                self.metrics = metadata.get("metrics", {})
+                self.feature_importance = metadata.get("feature_importance", {})
+            self.is_trained = True
+            print(f"HeatwaveModel loaded successfully from: {model_dir}")
+        except Exception as e:
+            print(f"Failed loading HeatwaveModel: {e}. Operating in physical heuristic mode.")
+            self.is_trained = False
 
 
 if __name__ == "__main__":

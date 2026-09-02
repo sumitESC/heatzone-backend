@@ -8,3 +8,6 @@ schedule
 tenacity
 pydantic
 numpy
+joblib
+scikit-learn
+xgboost
