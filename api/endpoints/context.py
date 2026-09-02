@@ -3,7 +3,27 @@ import pandas as pd
 import config
 from api.schemas import ContextResponse
 
+import os
+
 router = APIRouter()
+
+def _load_context_df():
+    if os.path.exists(config.INDIA_CONTEXT_WEATHER_CSV):
+        df = pd.read_csv(config.INDIA_CONTEXT_WEATHER_CSV)
+        df['Date'] = pd.to_datetime(df['Date'])
+        return df
+    
+    fallback_path = os.path.join(config.DATA_DIR, "temperature_data.csv")
+    if os.path.exists(fallback_path):
+        df = pd.read_csv(fallback_path)
+        df = df.rename(columns={"city": "City"})
+        if "Date" not in df.columns:
+            df["Date"] = pd.to_datetime(
+                df["year"].astype(str) + "-" + 
+                df["month"].astype(str).str.zfill(2) + "-01"
+            )
+        return df
+    return pd.DataFrame()
 
 @router.get("/india", response_model=ContextResponse)
 async def get_india_context(date: str):
@@ -11,8 +31,9 @@ async def get_india_context(date: str):
     Get the context signals from sentinel cities across India for a given date.
     """
     try:
-        df = pd.read_csv(config.INDIA_CONTEXT_WEATHER_CSV)
-        df['Date'] = pd.to_datetime(df['Date'])
+        df = _load_context_df()
+        if df.empty:
+            raise ValueError("Context data not available.")
         
         target_dt = pd.to_datetime(date)
         

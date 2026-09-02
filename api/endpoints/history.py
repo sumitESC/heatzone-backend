@@ -3,7 +3,27 @@ import pandas as pd
 import config
 from api.schemas import HistoryResponse
 
+import os
+
 router = APIRouter()
+
+def _load_history_df():
+    if os.path.exists(config.UP_WEATHER_CSV):
+        df = pd.read_csv(config.UP_WEATHER_CSV)
+        df['Date'] = pd.to_datetime(df['Date'])
+        return df
+    
+    fallback_path = os.path.join(config.DATA_DIR, "temperature_data.csv")
+    if os.path.exists(fallback_path):
+        df = pd.read_csv(fallback_path)
+        df = df.rename(columns={"city": "City"})
+        if "Date" not in df.columns:
+            df["Date"] = pd.to_datetime(
+                df["year"].astype(str) + "-" + 
+                df["month"].astype(str).str.zfill(2) + "-01"
+            )
+        return df
+    return pd.DataFrame()
 
 @router.get("/{city}", response_model=HistoryResponse)
 async def get_historical_weather(city: str, start_date: str, end_date: str):
@@ -11,8 +31,9 @@ async def get_historical_weather(city: str, start_date: str, end_date: str):
     Get historical weather data for a city.
     """
     try:
-        df = pd.read_csv(config.UP_WEATHER_CSV)
-        df['Date'] = pd.to_datetime(df['Date'])
+        df = _load_history_df()
+        if df.empty:
+            raise ValueError("Historical data not available.")
         
         city_df = df[df['City'].str.lower() == city.lower()]
         

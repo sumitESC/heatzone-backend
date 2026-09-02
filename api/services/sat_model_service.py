@@ -10,6 +10,7 @@ Uses real satellite indices (NDVI, NDBI, NDWI, LST, Albedo, etc.) and
 upstream climate event corridor data to generate hyper-localized forecasts.
 """
 
+import os
 import json
 import numpy as np
 import pandas as pd
